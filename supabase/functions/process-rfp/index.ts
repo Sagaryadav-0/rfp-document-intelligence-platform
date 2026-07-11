@@ -10,7 +10,6 @@ import ExcelJS from "npm:exceljs@4.4.0";
 import { createClient } from "npm:@supabase/supabase-js";
 import { extractText, getDocumentProxy, extractImages } from "npm:unpdf@1.6.2";
 import { PNG } from "npm:pngjs@6.0.0";
-import { verifyToken } from "../shared.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -18,10 +17,24 @@ const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
 
+const allowedOrigins = [
+    "http://localhost:5173",
+    "https://rfp-document-intelligence-platform.vercel.app",
+];
+
+const origin = req.headers.get("origin") ?? "";
+
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-app-token, x-session-id",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Origin":
+        allowedOrigins.includes(origin)
+            ? origin
+            : "https://rfp-document-intelligence-platform.vercel.app",
+
+    "Access-Control-Allow-Headers":
+        "authorization, x-client-info, apikey, content-type",
+
+    "Access-Control-Allow-Methods":
+        "POST, OPTIONS",
 };
 
 type Block =
@@ -238,8 +251,10 @@ function mergeParagraphs(blocks: Block[]): Block[] {
 }
 
 const TOP_HEADING_RE =
-  /^(?:section|chapter|part)\s+(\d{1,3})[\.\):\-—\s]+(.{2,120}?)$|^(\d{1,3})[\.\)]?\s+([A-Z][A-Za-z0-9 &/,\-—:]{2,120})$|^([A-Z][A-Z\s/&\-]{5,120})$/;
-const SUB_HEADING_RE = /^(\d{1,2}(?:\.\d{1,2}){1,3})\s+([A-Z].{1,100}?)$/;
+/^(?:(?:SECTION|CHAPTER|PART)\s+(\d{1,3})[\.\):\-–—\s]+(.+)|(\d{1,3})[\.\)]?\s+([A-Z][A-Z0-9 &(),\/\-:]{4,})|([A-Z][A-Z0-9 &(),\/\-]{6,}))$/i;
+
+const SUB_HEADING_RE =
+/^(\d{1,2}(?:\.\d{1,2}){1,3})\s+(.+)$/;
 
 function splitMultiGap(line: string): string[] | null {
 
@@ -467,30 +482,44 @@ if (
 }
 function mergeWrappedHeaders(rows: string[][]): string[][] {
 
-  if (rows.length < 2) return rows;
+    if (rows.length < 2) {
+        return rows;
+    }
 
-  const first = rows[0];
-  const second = rows[1];
+    const first = rows[0];
+    const second = rows[1];
 
-  const merged =
-    first.map((c, i) => {
-      const next = second[i] ?? "";
+    const merged: string[] = [];
 
-      // merge short wrapped header fragments
-  if (
-  c.length < 20 &&
-  next.length < 20 &&
-  !/^\d/.test(next) &&
-  /^[A-Za-z]/.test(c) &&
-  /^[A-Za-z]/.test(next)
-) {
-        return `${c} ${next}`.trim();
-      }
+    for (let i = 0; i < first.length; i++) {
 
-      return c;
-    });
+        const current = first[i] ?? "";
+        const next = second[i] ?? "";
 
-  return [merged, ...rows.slice(2)];
+        if (
+            current.length < 20 &&
+            next.length < 20 &&
+            !/^\d/.test(next) &&
+            /^[A-Za-z]/.test(current) &&
+            /^[A-Za-z]/.test(next)
+        ) {
+
+            merged.push(`${current} ${next}`.trim());
+
+        } else {
+
+            merged.push(current);
+
+        }
+    }
+
+    const result: string[][] = [merged];
+
+    for (let i = 2; i < rows.length; i++) {
+        result.push(rows[i]);
+    }
+
+    return result;
 }
 function looksLikeDelimitedRow(
   line: string
@@ -568,7 +597,7 @@ function reconstructCells(line: string): string[] | null {
 // After tokenizing pages, detect *table regions*: clusters of consecutive
 // numbered-row lines (>=2 in a row). Mark them with a shared tableId.
 type PendingTable = {
-  rows: string[];
+  rows: string[][];
   page: number;
 };
 function flushPendingTable(
@@ -579,13 +608,7 @@ function flushPendingTable(
   if (!pending || !current)
     return;
 const parsedRows =
-  pending.rows
-    .map(line =>
-      line
-        .split(" || ")
-        .map(x => x.trim())
-    )
-    .filter(r => r.length >= 2);
+    pending.rows.filter(r => r.length >= 2);
 
 if (
   parsedRows.length < 2 &&
@@ -662,17 +685,61 @@ for (let i = 1; i < normalizedRows.length; i++) {
     });
   });
 }
+function splitPipeLikeTable(line: string): string[] | null {
+
+    // collapse multiple spaces
+    const parts = line
+        .trim()
+        .split(/\s{2,}/)
+        .map(p => p.trim())
+        .filter(Boolean);
+
+    if (parts.length >= 3)
+        return parts;
+
+    return null;
+}
 function detectTableRow(
   line: string
 ): string[] | null {
+  // Fast rejection of obvious paragraph lines
+const trimmed = line.trim();
+
+if (!trimmed) {
+    return null;
+}
+
+// Very long sentence-like lines are almost never table rows
+if (
+    trimmed.length > 180 &&
+    !/\t/.test(trimmed) &&
+    !/\s{2,}/.test(trimmed)
+) {
+    return null;
+}
+
+// Skip expensive parsing for obvious paragraph lines
+const wordCount = trimmed.split(/\s+/).length;
+
+if (
+    wordCount > 35 &&
+    !/\t/.test(trimmed) &&
+    !/\s{2,}/.test(trimmed)
+) {
+    return null;
+}
 
   const candidates = [
 
-    splitMultiGap(line),
-    splitKeyedRow(line),
-    splitNumberedRow(line),
+// Run cheap detectors first
+splitPipeLikeTable(trimmed),
+splitMultiGap(trimmed),
 
-  ].filter(Boolean) as string[][];
+// Run expensive detectors only if needed
+splitKeyedRow(trimmed),
+splitNumberedRow(trimmed),
+
+].filter(Boolean) as string[][];
 
   if (candidates.length === 0)
     return null;
@@ -683,7 +750,13 @@ function detectTableRow(
     candidates.sort(
       (a, b) => b.length - a.length
     )[0];
-
+// Don't mistake headings for tables
+if (
+    best.length === 1 &&
+    best[0].trim().split(/\s+/).length < 8
+) {
+    return null;
+}
   // reject paragraph-like rows
   const joined =
     best.join(" ");
@@ -717,6 +790,17 @@ function buildSections(
   const sections: Section[] = [];
   let current: Section | null = null;
   let pendingTable: PendingTable | null = null;
+  let insideTable = false;
+  const flushTable = () => {
+    if (pendingTable) {
+        flushPendingTable(
+            pendingTable,
+            current
+        );
+        pendingTable = null;
+        insideTable = false;
+    }
+};
   const pushIntro = (page: number) => {
     if (!current) {
       current = { number: "0", title: "Preamble", page, blocks: [] };
@@ -729,12 +813,18 @@ function buildSections(
   // keep table alive across pages
     for (const raw of lines) {
       if (raw.length === 0) {
-        if (current && current.blocks.length > 0) {
-          const last = current.blocks[current.blocks.length - 1];
+        if (current) {
+
+    const blocks = current.blocks;
+
+    if (blocks.length > 0) {
+
+        const last = blocks[blocks.length - 1];
           if (last.type === "paragraph" && last.text !== "\u0000BREAK") {
-            current.blocks.push({ type: "paragraph", text: "\u0000BREAK", page });
+            blocks.push({ type: "paragraph", text: "\u0000BREAK", page });
           }
         }
+      }
         // blank lines should not aggressively break tables
 continue;
       }
@@ -750,41 +840,64 @@ continue;
 }
       if (!line) continue;
 
-      const top = line.match(TOP_HEADING_RE);
-      if (top) {
-        flushPendingTable(
-  pendingTable,
-  current
-);
+const top = line.match(TOP_HEADING_RE);
 
-pendingTable = null;
-        current = {
-          number: (top[1] ?? top[3]) as string,
-          title: ((top[2] ?? top[4]) as string).trim(),
-          page,
-          blocks: [],
-        };
-        sections.push(current);
-        continue;
-      }
-      const sub = line.match(SUB_HEADING_RE);
-      if (sub) {
-        flushPendingTable(
-  pendingTable,
-  current
-);
+const sub = line.match(SUB_HEADING_RE);
 
-pendingTable = null;
-  pushIntro(page);
+if (top) {
+
+    // Ignore short numbered headings like:
+    // 1. Assessment and Planning
+    // 2. Infrastructure Architecture
+
+    if (
+        /^\d+\./.test(line) &&
+        line.length < 90
+    ) {
+
+        pushIntro(page);
+
         current!.blocks.push({
-          type: "subheading",
-          text: `${sub[1]} ${sub[2].trim()}`,
-          level: sub[1].split(".").length,
-          page,
-          
+            type: "subheading",
+            text: line,
+            page,
         });
+
         continue;
-      }
+    }
+
+    flushTable();
+
+    current = {
+        number: (top[1] ?? "").trim(),
+        title: (top[2] ?? "").trim(),
+        page,
+        blocks: [],
+    };
+
+    sections.push(current);
+    current.blocks.push({
+    type: "heading",
+    text: `${sectionNumber} ${sectionTitle}`.trim(),
+    page,
+});
+    continue;
+}
+
+if (sub) {
+    flushTable();
+
+    pushIntro(page);
+
+    current!.blocks.push({
+        type: "subheading",
+        text: `${sub[1]} ${(sub[2] ?? "").trim()}`,
+        level: sub[1].split(".").length,
+        page,
+    });
+
+    continue;
+}
       const parsedTableRow =
   detectTableRow(line);
 
@@ -793,32 +906,27 @@ const looksTableLike =
 
 if (looksTableLike) {
 
-  if (!pendingTable) {
-    pendingTable = {
-      rows: [],
-      page,
-    };
-  }
+    insideTable = true;
 
-  pendingTable.rows.push(
-  parsedTableRow.join(" || ")
-);
+    if (!pendingTable) {
+        pendingTable = {
+            rows: [],
+            page,
+        };
+    }
 
-  continue;
+    pendingTable.rows.push(parsedTableRow);
+
+    continue;
 }
 // Close table only for strong non-table paragraph blocks
   const looksLikeLongParagraph =
-  line.length > 220 &&
-  line.split(/\s+/).length > 35 &&
-  /[.!?]$/.test(line);
+    line.length > 220 &&
+    (line.match(/\s+/g)?.length ?? 0) > 35 &&
+    /[.!?]$/.test(line);
 
 if (looksLikeLongParagraph) {
-  flushPendingTable(
-  pendingTable,
-  current
-);
-
-pendingTable = null;
+  flushTable();
   pushIntro(page);
   current!.blocks.push({
     type: "paragraph",
@@ -828,25 +936,33 @@ pendingTable = null;
 
   continue;
 }
-if (pendingTable) {
+if (insideTable && !looksTableLike) {
 
-  flushPendingTable(
-    pendingTable,
-    current
-  );
+    const continuation =
+    line.length < 180 &&
+    !top &&
+    !sub;
 
-  pendingTable = null;
+    if (continuation && pendingTable) {
+
+        const last =
+            pendingTable.rows[pendingTable.rows.length - 1];
+
+        if (last) {
+            last[last.length - 1] += " " + line;
+        }
+
+        continue;
+    }
+}
+if (pendingTable && insideTable) {
+    flushTable();
 }
       pushIntro(page);
       current!.blocks.push({ type: "paragraph", text: line, page });
     }
   });
-flushPendingTable(
-  pendingTable,
-  current
-);
-
-pendingTable = null;
+flushTable();
 for (const s of sections) {
 
   s.blocks =
@@ -1094,59 +1210,75 @@ function buildTableSheet(ws: ExcelJS.Worksheet, tableRows: Block[]) {
       rows.filter(x => x.length === a).length
     )[0];
 
-rows = rows.filter(r => {
+const filteredRows: string[][] = [];
 
-  // allow slight mismatch
-  if (
-    Math.abs(r.length - dominantCols) <= 1
-  ) {
-    return true;
-  }
+for (const row of rows) {
 
-  // preserve long descriptive rows
-  return (
-    r.join(" ").length > 40
-  );
-});
+    // allow slight mismatch
+    if (Math.abs(row.length - dominantCols) <= 1) {
+        filteredRows.push(row);
+        continue;
+    }
+
+    // preserve long descriptive rows
+    if (row.join(" ").length > 40) {
+        filteredRows.push(row);
+    }
+}
+
+rows = filteredRows;
   if (rows.length === 0) return;
 
   // --- HEADER --- 
   
 
 // table headers (dynamic)
-const maxCols = Math.max(
-  3,
-  ...rows.map(r => r.length)
-);
+let maxCols = 3;
+
+for (const row of rows) {
+    if (row.length > maxCols) {
+        maxCols = row.length;
+    }
+}
 // normalize rows to same column count
-rows = rows.map(r => {
+const normalizedRows: string[][] = [];
 
-  const copy = [...r];
+for (const row of rows) {
 
-  while (copy.length < maxCols)
-    copy.push("");
+    const copy = [...row];
 
-  // merge overflow into last column
-  if (copy.length > maxCols) {
+    while (copy.length < maxCols) {
+        copy.push("");
+    }
 
-    const extra =
-      copy.slice(maxCols - 1).join(" ");
+    if (copy.length > maxCols) {
 
-    copy.splice(
-      maxCols - 1,
-      copy.length,
-      extra
-    );
-  }
+        const extra = copy.slice(maxCols - 1).join(" ");
 
-  return copy;
-});
+        copy.splice(
+            maxCols - 1,
+            copy.length,
+            extra
+        );
+    }
+
+    normalizedRows.push(copy);
+}
+
+rows = normalizedRows;
 // detect header row
 const firstRow = rows[0] || [];
 
-const numericCount = rows.filter(r =>
-  /^\d+[\.\)]?$/.test((r[0] ?? "").trim())
-).length;
+let numericCount = 0;
+
+for (const row of rows) {
+
+    const firstCell = (row[0] ?? "").trim();
+
+    if (/^\d+[\.\)]?$/.test(firstCell)) {
+        numericCount++;
+    }
+}
 
 const firstColLooksNumeric =
   numericCount >= Math.ceil(rows.length * 0.7);
@@ -1443,17 +1575,25 @@ function regroupTables(blocks: Block[]): Block[][] {
 
       current.push(b);
 
-      // stabilize dominant structure
-      const counts =
-        current.map(r => r.cells.length);
+      // Fast dominant column calculation
+const freq = new Map<number, number>();
 
-      dominantCols =
-        counts
-          .sort(
-            (a,b) =>
-              counts.filter(x => x===b).length -
-              counts.filter(x => x===a).length
-          )[0];
+for (const row of current) {
+    const len = row.cells.length;
+    freq.set(len, (freq.get(len) ?? 0) + 1);
+}
+
+let bestCols = cols;
+let bestCount = 0;
+
+for (const [columnCount, occurrences] of freq) {
+    if (occurrences > bestCount) {
+        bestCount = occurrences;
+        bestCols = columnCount;
+    }
+}
+
+dominantCols = bestCols;
 
     } else {
 
@@ -1493,6 +1633,9 @@ async function buildWorkbook(sections: Section[], images: PdfImage[]): Promise<U
 
   const indexWs = wb.addWorksheet("Index", { views: [{ state: "frozen", ySplit: 1 }] });
   for (const section of sections) {
+    console.log(
+  `Building section ${section.number} - ${section.title}`
+);
     const baseName = `${section.number}. ${section.title}`.trim();
     const contentName = safeSheetName(baseName, used);
     const ws = wb.addWorksheet(contentName, { views: [{ state: "frozen", ySplit: 1 }] });
@@ -1537,8 +1680,21 @@ buildContentSheet(
 
   populateIndexSheet(indexWs, sections, sheetMap);
 
-  const buf = await wb.xlsx.writeBuffer();
-  return new Uint8Array(buf);
+let totalRows = 0;
+
+for (const ws of wb.worksheets) {
+    totalRows += ws.rowCount;
+}
+
+console.time("Workbook");
+console.time("Workbook Generation");
+
+const buf = await wb.xlsx.writeBuffer();
+console.timeEnd("Workbook Generation");
+
+console.timeEnd("Workbook");
+
+return new Uint8Array(buf);
 }
 
 // --- Page range filtering ----------------------------------------------------
@@ -1601,9 +1757,6 @@ Deno.serve(async (req) => {
     });
   }
 
-  // TEMP: bypass auth
-console.log("Auth bypassed");
-
   try {
     const contentType = req.headers.get("content-type") || "";
     let pdfBytes: Uint8Array;
@@ -1644,8 +1797,6 @@ console.log("Auth bypassed");
       sessionId = crypto.randomUUID();
     }
 
-    console.log(`Received session_id: ${sessionId}`);
-
     if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
       const { error: insertError } = await supabaseAdmin.from("rfp_sessions").insert({
         session_id: sessionId,
@@ -1683,10 +1834,7 @@ console.log("Auth bypassed");
     }
 
     const ranges = parsePageRanges(pageRangesInput);
-    console.log(`Processing PDF: ${filename}, size=${pdfBytes.length}, ranges=${JSON.stringify(ranges)}`);
     const { pages } = await extractStructured(pdfBytes);
-
-console.log(`Extracted ${pages.length} pages`);
 
 let filteredPages = pages;
 
@@ -1702,17 +1850,15 @@ if (ranges.length > 0) {
 
 let sections = buildSections(filteredPages);
 
-console.log(`Detected ${sections.length} sections`);
-
     const images: PdfImage[] = [];
 
-    const xlsx = await buildWorkbook(sections, images);
+const xlsx = await buildWorkbook(sections, images);
     const rangeSuffix = ranges.length
       ? " - p" + ranges.map((r) => (r.from === r.to ? `${r.from}` : `${r.from}-${r.to}`)).join(",")
       : "";
     const outName = filename.replace(/\.pdf$/i, "") + rangeSuffix + " - structured.xlsx";
 
-    let signedUrl: string | null = null;
+let signedUrl: string | null = null;
     if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
       const excelPath = `${sessionId}/${outName}`;
       const { error: uploadError } = await supabaseAdmin.storage
@@ -1758,12 +1904,17 @@ console.log(`Detected ${sections.length} sections`);
   } catch (err) {
     console.error("process-rfp error:", err);
     const msg = err instanceof Error ? err.message : "Unknown error";
-    return new Response(JSON.stringify({
-  error: msg,
-  debug: err
-}), {
-      status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return new Response(
+  JSON.stringify({
+    error: "Internal Server Error",
+  }),
+  {
+    status: 500,
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "application/json",
+    },
+  },
+);
   }
-});
+  });

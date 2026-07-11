@@ -29,3 +29,6 @@ dist-ssr
 .env.development.local
 .env.production.local
 .env.test.local
+
+# Supabase temporary files
+supabase/.temp/
