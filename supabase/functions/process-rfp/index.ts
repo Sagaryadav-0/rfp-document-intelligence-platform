@@ -17,24 +17,10 @@ const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
 
-const allowedOrigins = [
-    "http://localhost:5173",
-    "https://rfp-document-intelligence-platform.vercel.app",
-];
-
-const origin = req.headers.get("origin") ?? "";
-
 const corsHeaders = {
-    "Access-Control-Allow-Origin":
-        allowedOrigins.includes(origin)
-            ? origin
-            : "https://rfp-document-intelligence-platform.vercel.app",
-
-    "Access-Control-Allow-Headers":
-        "authorization, x-client-info, apikey, content-type",
-
-    "Access-Control-Allow-Methods":
-        "POST, OPTIONS",
+  "Access-Control-Allow-Origin": "https://rfp-document-intelligence-platform.vercel.app",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-app-token, x-session-id",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
 type Block =
@@ -87,22 +73,12 @@ async function extractStructured(bytes: Uint8Array): Promise<{
     .map(l => l.trim())
     .filter(Boolean);
 
-// Ignore first 3 lines (header)
-const HEADER_LINES = 2;
-const FOOTER_LINES = 2;
-const bodyWithoutHeader =
-    allLines.slice(HEADER_LINES);
-
-const body =
-    bodyWithoutHeader.slice(
-        0,
-        Math.max(
-            0,
-            bodyWithoutHeader.length - FOOTER_LINES
-        )
-    );
-
-const raw = body.filter(line => {
+const raw = allLines.filter(line => {
+  if (
+    /^confidential.*page\s+\d+\s+of\s+\d+$/i.test(line)
+) {
+    return false;
+}
 
     if (
         /^page\s+\d+/i.test(line) ||
@@ -131,6 +107,112 @@ const raw = body.filter(line => {
 };
   });
   return { pages };
+}
+
+function normalize(text: string): string {
+    return text
+        .replace(/[–—-]/g, "-")              // normalize dashes
+        .replace(/\d{1,2}\/\d{1,2}\/\d{2,4}/g, "#DATE#")
+        .replace(/\bpage\s+\d+\s+of\s+\d+\b/gi, "page # of #")
+        .replace(/\d+/g, "#")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+}
+
+function getRepeatedFooterKey(
+    lines: string[],
+    footerCounts: Map<number, Map<string, number>>,
+    threshold: number
+): { key: string; size: number } | null {
+
+    const maxFooterLines = Math.min(3, lines.length);
+
+    // Try largest block first
+    for (let size = maxFooterLines; size >= 1; size--) {
+
+        const key = lines
+            .slice(-size)
+            .map(normalize)
+            .join("|");
+
+        const count =
+            footerCounts.get(size)?.get(key) ?? 0;
+
+        if (count >= threshold) {
+            return { key, size };
+        }
+    }
+
+    return null;
+}
+
+function removeRepeatedHeadersFooters(
+    pages: {
+        pageNumber: number;
+        lines: string[];
+    }[]
+) {
+
+    const firstLineCount = new Map<string, number>();
+    const footerCounts = new Map<number, Map<string, number>>();
+
+    for (const page of pages) {
+
+        if (page.lines.length === 0)
+            continue;
+
+        const first = normalize(page.lines[0]);
+        firstLineCount.set(first,(firstLineCount.get(first) ?? 0) + 1);
+        for (let size = 1; size <= Math.min(3, page.lines.length); size++) {
+
+    const key = page.lines
+        .slice(-size)
+        .map(normalize)
+        .join("|");
+
+    if (!footerCounts.has(size)) {
+        footerCounts.set(size, new Map());
+    }
+
+    const map = footerCounts.get(size)!;
+
+    map.set(
+        key,
+        (map.get(key) ?? 0) + 1
+    );
+    }
+  }
+    const threshold =
+        Math.max(2, Math.floor(pages.length * 0.7));
+
+    return pages.map(page => {
+
+        let lines = [...page.lines];
+
+        if (
+            lines.length &&
+            (firstLineCount.get(normalize(lines[0])) ?? 0) >= threshold
+        ) {
+            lines.shift();
+        }
+
+        const footer =
+    getRepeatedFooterKey(
+        lines,
+        footerCounts,
+        threshold
+    );
+
+if (footer) {
+    lines.splice(-footer.size);
+}
+
+        return {
+            ...page,
+            lines
+        };
+    });
 }
 
 // Encode raw pixel data (from unpdf extractImages) into PNG bytes.
@@ -251,10 +333,8 @@ function mergeParagraphs(blocks: Block[]): Block[] {
 }
 
 const TOP_HEADING_RE =
-/^(?:(?:SECTION|CHAPTER|PART)\s+(\d{1,3})[\.\):\-–—\s]+(.+)|(\d{1,3})[\.\)]?\s+([A-Z][A-Z0-9 &(),\/\-:]{4,})|([A-Z][A-Z0-9 &(),\/\-]{6,}))$/i;
-
-const SUB_HEADING_RE =
-/^(\d{1,2}(?:\.\d{1,2}){1,3})\s+(.+)$/;
+  /^(?:section|chapter|part)\s+(\d{1,3})[\.\):\-—\s]+(.{2,120}?)$|^(\d{1,3})[\.\)]?\s+([A-Z][A-Za-z0-9 &/,\-—:]{2,120})$|^([A-Z][A-Z\s/&\-]{5,120})$/;
+const SUB_HEADING_RE = /^(\d{1,2}(?:\.\d{1,2}){1,3})\s+([A-Z].{1,100}?)$/;
 
 function splitMultiGap(line: string): string[] | null {
 
@@ -845,42 +925,19 @@ const top = line.match(TOP_HEADING_RE);
 const sub = line.match(SUB_HEADING_RE);
 
 if (top) {
-
-    // Ignore short numbered headings like:
-    // 1. Assessment and Planning
-    // 2. Infrastructure Architecture
-
-    if (
-        /^\d+\./.test(line) &&
-        line.length < 90
-    ) {
-
-        pushIntro(page);
-
-        current!.blocks.push({
-            type: "subheading",
-            text: line,
-            page,
-        });
-
-        continue;
-    }
-
     flushTable();
 
+    const sectionNumber = (top[1] ?? top[3] ?? "").trim();
+    const sectionTitle = (top[2] ?? top[4] ?? top[5] ?? "").trim();
+
     current = {
-        number: (top[1] ?? "").trim(),
-        title: (top[2] ?? "").trim(),
+        number: sectionNumber,
+        title: sectionTitle,
         page,
         blocks: [],
     };
 
     sections.push(current);
-    current.blocks.push({
-    type: "heading",
-    text: `${sectionNumber} ${sectionTitle}`.trim(),
-    page,
-});
     continue;
 }
 
@@ -1633,9 +1690,6 @@ async function buildWorkbook(sections: Section[], images: PdfImage[]): Promise<U
 
   const indexWs = wb.addWorksheet("Index", { views: [{ state: "frozen", ySplit: 1 }] });
   for (const section of sections) {
-    console.log(
-  `Building section ${section.number} - ${section.title}`
-);
     const baseName = `${section.number}. ${section.title}`.trim();
     const contentName = safeSheetName(baseName, used);
     const ws = wb.addWorksheet(contentName, { views: [{ state: "frozen", ySplit: 1 }] });
@@ -1680,19 +1734,7 @@ buildContentSheet(
 
   populateIndexSheet(indexWs, sections, sheetMap);
 
-let totalRows = 0;
-
-for (const ws of wb.worksheets) {
-    totalRows += ws.rowCount;
-}
-
-console.time("Workbook");
-console.time("Workbook Generation");
-
 const buf = await wb.xlsx.writeBuffer();
-console.timeEnd("Workbook Generation");
-
-console.timeEnd("Workbook");
 
 return new Uint8Array(buf);
 }
@@ -1793,7 +1835,6 @@ Deno.serve(async (req) => {
     }
 
     if (!sessionId) {
-      console.log("No session_id received → generating new one");
       sessionId = crypto.randomUUID();
     }
 
@@ -1818,9 +1859,9 @@ Deno.serve(async (req) => {
           upsert: false,
         });
       if (uploadError) {
-        console.error("PDF upload failed:", uploadError.message);
+        console.error("PDF upload failed:");
       } else {
-        console.log(`PDF uploaded to storage: ${storagePath}`);
+
       }
     } else {
       console.warn("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing; skipping db metadata insert and storage upload.");
@@ -1832,33 +1873,38 @@ Deno.serve(async (req) => {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
-
+    
     const ranges = parsePageRanges(pageRangesInput);
-    const { pages } = await extractStructured(pdfBytes);
 
-let filteredPages = pages;
+    const { pages } =
+    await extractStructured(pdfBytes);
+
+const cleanedPages =
+    removeRepeatedHeadersFooters(pages);
+
+let filteredPages = cleanedPages;
 
 if (ranges.length > 0) {
-  filteredPages = pages.filter((p) =>
-  pageInRanges(p.pageNumber, ranges)
-);
+    filteredPages = cleanedPages.filter((p) =>
+        pageInRanges(p.pageNumber, ranges)
+    );
 
-  console.log(
-    `After page filtering: ${filteredPages.length} pages retained`
-  );
 }
 
 let sections = buildSections(filteredPages);
 
     const images: PdfImage[] = [];
 
+
 const xlsx = await buildWorkbook(sections, images);
+
     const rangeSuffix = ranges.length
       ? " - p" + ranges.map((r) => (r.from === r.to ? `${r.from}` : `${r.from}-${r.to}`)).join(",")
       : "";
     const outName = filename.replace(/\.pdf$/i, "") + rangeSuffix + " - structured.xlsx";
 
 let signedUrl: string | null = null;
+
     if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
       const excelPath = `${sessionId}/${outName}`;
       const { error: uploadError } = await supabaseAdmin.storage
@@ -1868,7 +1914,7 @@ let signedUrl: string | null = null;
           upsert: true,
         });
       if (uploadError) {
-        console.error("Excel upload failed:", uploadError.message);
+        console.error("Excel upload failed:");
       } else {
         const { data: urlData, error: urlError } = await supabaseAdmin.storage
           .from("rfp-files")
@@ -1905,16 +1951,11 @@ let signedUrl: string | null = null;
     console.error("process-rfp error:", err);
     const msg = err instanceof Error ? err.message : "Unknown error";
     return new Response(
-  JSON.stringify({
-    error: "Internal Server Error",
-  }),
-  {
-    status: 500,
-    headers: {
-      ...corsHeaders,
-      "Content-Type": "application/json",
-    },
-  },
-);
+    JSON.stringify({
+        error: "Internal Server Error"
+}), {
+      status: 500,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   }
-  });
+});
